@@ -1,24 +1,136 @@
-name: Sync to Hugging Face Space
+name: CI/CD — Accident Severity API
 
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
-  sync-to-hub:
+  # ──────────────────────────────────────────────────────────────────
+  # JOB 1: Lint, syntax check, and file presence validation
+  # Runs on every push and every PR. Fast (~1 min). No heavy deps.
+  # ──────────────────────────────────────────────────────────────────
+  validate:
+    name: Lint & Validate
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip" # caches ~/.cache/pip across runs
+
+      - name: Install lint tools
+        run: pip install ruff
+
+      - name: Lint with Ruff
+        run: ruff check app.py tests/
+
+      - name: Check Python syntax
+        run: python -m py_compile app.py && echo "Syntax OK"
+
+      - name: Verify required files exist
+        run: |
+          MISSING=0
+          for f in app.py requirements.txt Dockerfile best.pt severity_model.keras; do
+            if [ ! -f "$f" ]; then
+              echo "MISSING: $f"
+              MISSING=1
+            else
+              echo "OK: $f"
+            fi
+          done
+          if [ "$MISSING" -eq 1 ]; then
+            echo "One or more required files are missing. Aborting."
+            exit 1
+          fi
+
+  # ──────────────────────────────────────────────────────────────────
+  # JOB 2: Run test suite (mocked ML models, no torch/tf needed)
+  # Depends on validate passing. Runs on every push and PR.
+  # ──────────────────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install test dependencies
+        run: |
+          pip install \
+            fastapi==0.104.1 \
+            uvicorn==0.24.0 \
+            httpx \
+            pillow==10.0.1 \
+            numpy"<2.0.0" \
+            python-multipart==0.0.6 \
+            pytest \
+            pytest-asyncio
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+
+  # ──────────────────────────────────────────────────────────────────
+  # JOB 3: Deploy to Hugging Face Space
+  # Only runs on pushes to main (not on PRs). Requires both jobs above.
+  # Smoke-tests the live endpoint after deploy with retries.
+  # ──────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Hugging Face
+    runs-on: ubuntu-latest
+    needs: [validate, test]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          lfs: true # Crucial for your .pt and .keras files
+          lfs: true
 
-      - name: Push to Hugging Face
+      - name: Push to Hugging Face Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          # Connecting GitHub to your specific HF Space
-          git remote add space https://Lord731095:$HF_TOKEN@huggingface.co/spaces/Lord731095/accidentSeverity-api
+          git remote add space \
+            https://Lord731095:$HF_TOKEN@huggingface.co/spaces/Lord731095/accidentSeverity-api
           git push --force space main
+          echo "Push complete. Waiting for Space to rebuild..."
+
+      - name: Smoke test — health check with retries
+        # HF Spaces take 2-5 min to rebuild. Retry every 30s for up to 10 minutes.
+        run: |
+          HF_URL="https://lord731095-accidentseverity-api.hf.space"
+          MAX_RETRIES=20
+          SLEEP_INTERVAL=30
+
+          echo "Polling $HF_URL ..."
+          for i in $(seq 1 $MAX_RETRIES); do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HF_URL/")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "Smoke test passed on attempt $i (HTTP 200). Deployment is live."
+              exit 0
+            fi
+            echo "Attempt $i/$MAX_RETRIES: HTTP $HTTP_STATUS — retrying in ${SLEEP_INTERVAL}s..."
+            sleep $SLEEP_INTERVAL
+          done
+
+          echo "Smoke test FAILED after $MAX_RETRIES attempts. Check the HF Space logs."
+          exit 1
