@@ -1,107 +1,330 @@
 import io
+import os
+import cv2
+import base64
+import tempfile
+import logging
 import numpy as np
 import tensorflow as tf
-from PIL import Image
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from PIL import Image, UnidentifiedImageError
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 
-# Initialize FastAPI app
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("severity-api")
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 app = FastAPI(title="Traffic Accident Severity API")
 
-# Allow your Lovable/Vercel frontend to communicate with this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # For production, replace "*" with your live Vercel URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ==========================================
-# 1. LOAD MODELS ON STARTUP
-# ==========================================
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+LABELS        = ["Minor", "Moderate", "Severe"]
+IMG_SIZE      = (224, 224)          # EfficientNetB0 input size
+MAX_FILE_MB   = 100                 # hard cap for uploaded files
+SEVERITY_RANK = {"Minor": 0, "Moderate": 1, "Severe": 2}
 
-print("Loading YOLOv11 Model...")
-try:
-    # IMPORTANT: Ensure your YOLO file is named exactly this in your GitHub repo
-    yolo_model = YOLO('best.pt') 
-except Exception as e:
-    print(f"Error loading YOLO: {e}")
+ALLOWED_IMAGE_TYPES = {
+    "image/jpeg", "image/jpg", "image/png",
+    "image/webp", "image/bmp",
+    "application/octet-stream",   # some frontends send raw bytes with this
+}
+ALLOWED_VIDEO_TYPES = {
+    "video/mp4", "video/mpeg", "video/quicktime", "video/x-msvideo",
+    "application/octet-stream",
+}
 
-print("Loading EfficientNet Keras Model...")
-try:
-    # IMPORTANT: Ensure your Keras file is named exactly this in your GitHub repo
-    keras_model = tf.keras.models.load_model('severity_model.keras', compile=False)
-except Exception as e:
-    print(f"Error loading Keras model: {e}")
+# ---------------------------------------------------------------------------
+# Model loading  (crashes on startup if files are missing — intentional)
+# ---------------------------------------------------------------------------
+logger.info("Loading YOLO model …")
+yolo_model = YOLO("best.pt")
 
-# ==========================================
-# 2. UTILITY FUNCTIONS
-# ==========================================
+logger.info("Loading Keras severity model …")
+keras_model = tf.keras.models.load_model("severity_model.keras", compile=False)
 
-def preprocess_keras(image):
-    """Prepares the cropped PIL Image for EfficientNet-B0 (.keras)"""
-    # Resize to standard EfficientNet input size
-    img = image.resize((224, 224))
-    img_array = tf.keras.preprocessing.image.img_to_array(img)
-    # Add batch dimension (1, 224, 224, 3)
-    img_array = np.expand_dims(img_array, axis=0)
-    
-    # Note: If your Keras model expects inputs scaled from 0-1, uncomment the line below:
-    # img_array = img_array / 255.0 
-    return img_array
+logger.info("Both models loaded successfully.")
 
-# ==========================================
-# 3. API ENDPOINTS
-# ==========================================
 
-@app.get("/")
-def health_check():
-    """Simple endpoint to verify the server is running."""
-    return {"status": "Backend is active and waiting for video frames."}
-
-@app.post("/classify-frame/")
-async def classify_frame(file: UploadFile = File(...)):
-    """Receives a frame, detects a crash, and classifies severity."""
+# ---------------------------------------------------------------------------
+# Helper: decode image bytes → PIL Image
+# Handles raw JPEG/PNG, and base64 (with or without data-URI header)
+# ---------------------------------------------------------------------------
+def decode_image(raw: bytes) -> Image.Image:
+    # --- 1. Try direct PIL decode (JPEG, PNG, WebP, BMP, …) ---
     try:
-        # Read the image sent from the React frontend
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
-        
-        # --- Stage 1: YOLO Detection ---
-        results = yolo_model(image)
-        boxes = results[0].boxes
-        
-        # If no vehicle/crash is detected in this frame, return early
-        if len(boxes) == 0:
-            return {"status": "no_crash", "severity": None}
-        
-        # Get the highest-confidence bounding box [x1, y1, x2, y2]
-        box = boxes[0].xyxy[0].tolist() 
-        
-        # Crop the image to just the detected crash area
-        cropped_img = image.crop((box[0], box[1], box[2], box[3]))
-        
-        # --- Stage 2: Keras Classification ---
-        keras_input = preprocess_keras(cropped_img)
-        predictions = keras_model.predict(keras_input)
-        
-        # Extract the highest probability class
-        class_idx = np.argmax(predictions[0])
-        confidence = float(np.max(predictions[0]))
-        
-        # Map integer prediction to text labels
-        labels = ["Minor", "Moderate", "Severe"]
-        severity = labels[class_idx]
-        
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        logger.info("Image decoded directly via PIL.")
+        return img
+    except (UnidentifiedImageError, Exception):
+        pass
+
+    # --- 2. Try base64  (strip data-URI prefix if present) ---
+    try:
+        candidate = raw
+        if b"base64," in candidate:
+            candidate = candidate.split(b"base64,", 1)[1]
+        # strip surrounding whitespace / quotes that some clients add
+        candidate = candidate.strip().strip(b'"').strip(b"'")
+        decoded = base64.b64decode(candidate)
+        img = Image.open(io.BytesIO(decoded)).convert("RGB")
+        logger.info("Image decoded via base64.")
+        return img
+    except Exception:
+        pass
+
+    raise ValueError(
+        "Cannot decode the uploaded data. "
+        "Accepted formats: JPEG, PNG, WebP, BMP, or a base64-encoded version of any of these."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helper: preprocess PIL Image for EfficientNetB0
+# ---------------------------------------------------------------------------
+def preprocess_for_keras(pil_image: Image.Image) -> np.ndarray:
+    """
+    Resize → RGB → EfficientNetB0 preprocess_input (scales to [-1, 1]).
+    Returns shape (1, 224, 224, 3).
+    """
+    img = pil_image.resize(IMG_SIZE, Image.BILINEAR).convert("RGB")
+    arr = np.array(img, dtype=np.float32)
+    arr = tf.keras.applications.efficientnet.preprocess_input(arr)
+    return np.expand_dims(arr, axis=0)
+
+
+# ---------------------------------------------------------------------------
+# Core inference pipeline
+# ---------------------------------------------------------------------------
+def run_pipeline(pil_image: Image.Image) -> dict:
+    """
+    1. YOLO detects crash region (returns no_crash if nothing found).
+    2. Crop the highest-confidence box.
+    3. EfficientNetB0 classifies severity.
+    """
+    results = yolo_model(pil_image, verbose=False)
+    boxes   = results[0].boxes
+
+    if boxes is None or len(boxes) == 0:
         return {
-            "status": "crash_detected",
-            "severity": severity,
-            "confidence": round(confidence, 3),
-            "box": [round(c, 2) for c in box] # Return coordinates for frontend visualization
+            "status":     "no_crash",
+            "severity":   None,
+            "confidence": None,
+            "box":        None,
         }
 
-    except Exception as e:
-        print(f"Server Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    # Pick the detection with the highest YOLO confidence score
+    yolo_confs = boxes.conf.cpu().numpy()
+    best_idx   = int(np.argmax(yolo_confs))
+    box        = boxes[best_idx].xyxy[0].cpu().numpy().tolist()   # [x1, y1, x2, y2]
+
+    # Sanity-check: ensure the crop has positive area
+    x1, y1, x2, y2 = box
+    if x2 <= x1 or y2 <= y1:
+        return {
+            "status":     "no_crash",
+            "severity":   None,
+            "confidence": None,
+            "box":        None,
+        }
+
+    cropped       = pil_image.crop((x1, y1, x2, y2))
+    keras_input   = preprocess_for_keras(cropped)
+    predictions   = keras_model.predict(keras_input, verbose=0)   # shape (1, 3)
+    class_idx     = int(np.argmax(predictions[0]))
+    severity_conf = float(np.max(predictions[0]))
+
+    return {
+        "status":     "crash_detected",
+        "severity":   LABELS[class_idx],
+        "confidence": severity_conf,
+        "box":        box,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Endpoint: health check
+# ---------------------------------------------------------------------------
+@app.get("/")
+def health_check():
+    return {"status": "Backend is active"}
+
+
+# ---------------------------------------------------------------------------
+# Endpoint: classify a single frame / image
+# Accepts:
+#   - multipart file upload (JPEG, PNG, WebP, BMP)
+#   - raw bytes whose content-type is application/octet-stream
+# ---------------------------------------------------------------------------
+@app.post("/classify-frame/")
+async def classify_frame(file: UploadFile = File(...)):
+    # Content-type check (lenient — browsers/frontends are inconsistent)
+    ct = (file.content_type or "").lower()
+    if ct and ct not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported content type '{ct}'. Send JPEG, PNG, WebP, or BMP.",
+        )
+
+    contents = await file.read()
+
+    if len(contents) == 0:
+        raise HTTPException(status_code=400, detail="Empty file received.")
+
+    if len(contents) > MAX_FILE_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds {MAX_FILE_MB} MB limit.",
+        )
+
+    try:
+        image  = decode_image(contents)
+        result = run_pipeline(image)
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        logger.exception("classify-frame failed")
+        raise HTTPException(status_code=500, detail=f"Processing error: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Endpoint: classify from base64 JSON body
+# Body: { "image": "<base64 string or data-URI>" }
+# ---------------------------------------------------------------------------
+@app.post("/classify-base64/")
+async def classify_base64(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON.")
+
+    if "image" not in body:
+        raise HTTPException(status_code=400, detail="Missing key 'image' in JSON body.")
+
+    raw = body["image"]
+    if not isinstance(raw, str) or not raw.strip():
+        raise HTTPException(status_code=400, detail="'image' must be a non-empty string.")
+
+    try:
+        image  = decode_image(raw.encode())
+        result = run_pipeline(image)
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        logger.exception("classify-base64 failed")
+        raise HTTPException(status_code=500, detail=f"Processing error: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Endpoint: classify an MP4 video
+# Samples every `sample_every` frames (default = 30).
+# Returns per-frame results + an overall worst-case severity summary.
+# ---------------------------------------------------------------------------
+@app.post("/classify-video/")
+async def classify_video(
+    file: UploadFile = File(...),
+    sample_every: int = 30,          # process 1 frame every N frames
+):
+    ct = (file.content_type or "").lower()
+    if ct and ct not in ALLOWED_VIDEO_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported content type '{ct}'. Send MP4, MOV, or AVI.",
+        )
+
+    contents = await file.read()
+
+    if len(contents) == 0:
+        raise HTTPException(status_code=400, detail="Empty file received.")
+
+    if len(contents) > MAX_FILE_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds {MAX_FILE_MB} MB limit.",
+        )
+
+    tmp_path = None
+    try:
+        # Write to a temp file so OpenCV can open it
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp.write(contents)
+            tmp_path = tmp.name
+
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            raise ValueError("OpenCV could not open the video. File may be corrupted or unsupported.")
+
+        frame_results = []
+        frame_idx     = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx % sample_every == 0:
+                rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil   = Image.fromarray(rgb)
+                res   = run_pipeline(pil)
+                res["frame_index"] = frame_idx
+                frame_results.append(res)
+
+            frame_idx += 1
+
+        cap.release()
+
+        if not frame_results:
+            return {
+                "status":          "no_frames_processed",
+                "overall_severity": None,
+                "frames_analyzed":  0,
+                "frame_results":   [],
+            }
+
+        crash_frames = [r for r in frame_results if r["status"] == "crash_detected"]
+
+        if not crash_frames:
+            return {
+                "status":           "no_crash",
+                "overall_severity": None,
+                "frames_analyzed":  len(frame_results),
+                "crash_count":      0,
+                "frame_results":    frame_results,
+            }
+
+        # Overall severity = worst frame
+        worst = max(crash_frames, key=lambda r: SEVERITY_RANK.get(r["severity"], -1))
+
+        return {
+            "status":              "crash_detected",
+            "overall_severity":    worst["severity"],
+            "overall_confidence":  worst["confidence"],
+            "frames_analyzed":     len(frame_results),
+            "crash_count":         len(crash_frames),
+            "frame_results":       frame_results,
+        }
+
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        logger.exception("classify-video failed")
+        raise HTTPException(status_code=500, detail=f"Video processing error: {exc}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
