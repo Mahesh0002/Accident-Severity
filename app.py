@@ -328,3 +328,15 @@ async def classify_video(
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+@app.get("/debug-model/")
+def debug_model():
+    import numpy as np
+    dummy = np.zeros((1, 224, 224, 3), dtype=np.float32)
+    raw = keras_model.predict(dummy, verbose=0)
+    return {
+        "output_shape":     str(keras_model.output_shape),
+        "last_layer":       str(keras_model.layers[-1].get_config()),
+        "raw_predictions":  raw.tolist(),
+        "predictions_sum":  float(raw.sum()),
+    }
