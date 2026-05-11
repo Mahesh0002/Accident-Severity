@@ -1,9 +1,10 @@
 ---
-title: My App
+title: AccidentSeverity API
 emoji: 🐳
-colorFrom: blue
-colorTo: purple
+colorFrom: red
+colorTo: orange
 sdk: docker
+app_port: 7860
 pinned: false
 ---
 
