@@ -12,7 +12,6 @@ Covers:
 import base64
 import io
 import pytest
-import numpy as np
 from PIL import Image
 from unittest.mock import patch, MagicMock
 
