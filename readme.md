@@ -1,5 +1,6 @@
 ---
 title: My App
+emoji: 🐳
 colorFrom: blue
 colorTo: purple
 sdk: docker
