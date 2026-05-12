@@ -1,9 +1,11 @@
 ---
-title: AccidentSeverity API
-emoji: 🚗
+title: Traffic Accident Severity API
+emoji: 🚦
 colorFrom: red
-colorTo: orange
+colorTo: slate
 sdk: docker
-app_port: 7860
+sdk_version: "20.10.23"
+python_version: "3.10"
+app_file: app.py
 pinned: false
 ---
